@@ -267,11 +267,256 @@ def get_simulation_matches(sport_key: str) -> List[Dict[str, Any]]:
     return events
 
 
+SHARP_TENNIS_PRIORITY: Dict[str, int] = {
+    "pinnacle": 1,
+    "betfair_ex_eu": 2,
+    "betfair_sb_uk": 3,
+    "betfair": 4,
+    "bet365": 5,
+    "williamhill": 6,
+    "unibet": 7,
+    "betsson": 8,
+    "betplay": 9,
+    "rushbet": 10,
+    "wplay": 11,
+}
+
+
+def calc_tennis_vig_free_probs(o1: float, o2: float) -> Tuple[float, float]:
+    """Calculates clean Vig-Free probabilities for a 2-way tennis market."""
+    if o1 <= 1.0 or o2 <= 1.0:
+        return 0.50, 0.50
+    inv1 = 1.0 / o1
+    inv2 = 1.0 / o2
+    tot = inv1 + inv2
+    return round(inv1 / tot, 4), round(inv2 / tot, 4)
+
+
+def extract_event_tennis_odds(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Extracts the highest-liquidity sharp market odds for Player 1 and Player 2 from an event.
+
+    Prioritizes global sharp books (Pinnacle, Betfair, Bet365) and falls back to
+    available retail books. Returns clean Vig-Free probabilities and odds dictionary.
+    """
+    p1 = event.get("home_team", "Jugador A")
+    p2 = event.get("away_team", "Jugador B")
+
+    best_bm: Optional[Dict[str, Any]] = None
+    best_rank = 999
+
+    for bm in event.get("bookmakers", []):
+        bm_key = str(bm.get("key", "")).lower()
+        rank = SHARP_TENNIS_PRIORITY.get(bm_key, 50)
+        has_h2h = any(m.get("key") == "h2h" for m in bm.get("markets", []))
+        if has_h2h and rank < best_rank:
+            best_rank = rank
+            best_bm = bm
+
+    o1 = 1.85
+    o2 = 1.85
+    bm_name = "Sharp Book"
+    bm_key = "pinnacle"
+
+    if best_bm:
+        bm_name = best_bm.get("title", best_bm.get("key", "Sharp Book"))
+        bm_key = best_bm.get("key", "sharp")
+        for m in best_bm.get("markets", []):
+            if m.get("key") == "h2h":
+                for o in m.get("outcomes", []):
+                    if o.get("name") == p1:
+                        o1 = float(o.get("price", o1))
+                    elif o.get("name") == p2:
+                        o2 = float(o.get("price", o2))
+
+    vf1, vf2 = calc_tennis_vig_free_probs(o1, o2)
+
+    return {
+        "1": o1,
+        "2": o2,
+        "vig_free_1": vf1,
+        "vig_free_2": vf2,
+        "bookmaker": bm_name,
+        "bookmaker_key": bm_key,
+        "is_sharp": best_rank <= 7,
+    }
+
+
+
+# ==============================================================================
+# SMART MONEY & STEAM CHASING IN TENNIS (LINE DROP TRACKER)
+# ==============================================================================
+
+_TENNIS_STEAM_CACHE: Dict[str, Dict[str, Any]] = {}
+
+def extract_sharp_tennis_odds(event: Dict[str, Any]) -> Tuple[Optional[Dict[str, float]], str]:
+    """Pulls current Pinnacle or Sharp consensus odds for Player 1 and Player 2."""
+    p1 = event.get("home_team", "Player 1")
+    p2 = event.get("away_team", "Player 2")
+    bookmakers = event.get("bookmakers", [])
+
+    pinnacle = next((b for b in bookmakers if b.get("key") == "pinnacle"), None)
+    target_bm = pinnacle if pinnacle else (bookmakers[0] if bookmakers else None)
+
+    if not target_bm:
+        return None, "None"
+
+    bm_name = target_bm.get("title", target_bm.get("key", "Sharp"))
+    odds_map: Dict[str, float] = {}
+    for m in target_bm.get("markets", []):
+        if m.get("key") == "h2h":
+            for o in m.get("outcomes", []):
+                if o.get("name") == p1:
+                    odds_map["1"] = float(o.get("price", 0.0))
+                elif o.get("name") == p2:
+                    odds_map["2"] = float(o.get("price", 0.0))
+            break
+
+    if "1" in odds_map and "2" in odds_map:
+        return odds_map, bm_name
+    return None, bm_name
+
+
+def update_tennis_steam_cache(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Caches opening line and updates latest odds to detect line movement in tennis."""
+    p1 = event.get("home_team", "")
+    p2 = event.get("away_team", "")
+    ev_id = str(event.get("id") or f"{p1} vs {p2}")
+    now = datetime.now()
+    curr_odds, bm_name = extract_sharp_tennis_odds(event)
+
+    sim_open = event.get("opening_odds")
+    sim_time_ago = float(event.get("opening_hours_ago", 2.5))
+
+    if ev_id not in _TENNIS_STEAM_CACHE:
+        if sim_open:
+            _TENNIS_STEAM_CACHE[ev_id] = {
+                "first_seen": now - timedelta(hours=sim_time_ago),
+                "open_odds": dict(sim_open),
+                "last_seen": now,
+                "current_odds": curr_odds if curr_odds else dict(sim_open),
+                "bookmaker": bm_name,
+                "p1": p1,
+                "p2": p2,
+            }
+        else:
+            if curr_odds:
+                _TENNIS_STEAM_CACHE[ev_id] = {
+                    "first_seen": now,
+                    "open_odds": dict(curr_odds),
+                    "last_seen": now,
+                    "current_odds": dict(curr_odds),
+                    "bookmaker": bm_name,
+                    "p1": p1,
+                    "p2": p2,
+                }
+    else:
+        cached = _TENNIS_STEAM_CACHE[ev_id]
+        cached["last_seen"] = now
+        if curr_odds:
+            cached["current_odds"] = dict(curr_odds)
+            cached["bookmaker"] = bm_name
+
+    return _TENNIS_STEAM_CACHE.get(ev_id, {})
+
+
+def detect_tennis_steam_moves(
+    event_or_odds: Any,
+    window_hours: float = 4.0,
+    threshold_pct: float = 10.0,
+) -> Dict[str, Any]:
+    """Detects if a tennis player's odds dropped > 10% in the last 4 hours (Steam Chasing).
+    In professional tennis, this strongly correlates with opponent injury / illness alerts
+    or institutional sharp syndicate money.
+    """
+    if isinstance(event_or_odds, dict) and ("home_team" in event_or_odds or "bookmakers" in event_or_odds):
+        event = event_or_odds
+        cached = update_tennis_steam_cache(event)
+    elif isinstance(event_or_odds, str) and event_or_odds in _TENNIS_STEAM_CACHE:
+        cached = _TENNIS_STEAM_CACHE[event_or_odds]
+    elif isinstance(event_or_odds, dict) and "open_odds" in event_or_odds:
+        cached = event_or_odds
+    else:
+        cached = {}
+
+    if not cached or "open_odds" not in cached or "current_odds" not in cached:
+        return {
+            "is_steam": False,
+            "steam_detected": False,
+            "drop_pct": 0.0,
+            "side": None,
+            "player": "",
+            "open_odds": 0.0,
+            "current_odds": 0.0,
+            "hours_elapsed": 0.0,
+            "badge": "⚪ LÍNEA ESTABLE",
+            "description": "Sin datos de apertura suficientes.",
+            "bonus_points": 0.0,
+        }
+
+    first_seen = cached["first_seen"]
+    last_seen = cached["last_seen"]
+    hours_elapsed = max(0.1, (last_seen - first_seen).total_seconds() / 3600.0)
+
+    open_o = cached["open_odds"]
+    curr_o = cached["current_odds"]
+    p1 = cached.get("p1", "Jugador 1")
+    p2 = cached.get("p2", "Jugador 2")
+
+    max_drop = 0.0
+    favored_side = None
+    favored_player = ""
+    open_val = 0.0
+    curr_val = 0.0
+
+    for side, p_name in [("1", p1), ("2", p2)]:
+        if side in open_o and side in curr_o:
+            o_init = float(open_o[side])
+            o_now = float(curr_o[side])
+            if o_init > 1.0 and o_now < o_init:
+                drop_pct = ((o_init - o_now) / o_init) * 100.0
+                if drop_pct > max_drop:
+                    max_drop = drop_pct
+                    favored_side = side
+                    favored_player = p_name
+                    open_val = o_init
+                    curr_val = o_now
+
+    is_steam = (max_drop >= threshold_pct) and (hours_elapsed <= window_hours)
+
+    if is_steam:
+        badge = "🚨 ALERTA SMART MONEY (Alerta Lesión / Dinero Institucional)"
+        desc = (
+            f"Caída de cuota institucional de {max_drop:.1f}% en {favored_player} "
+            f"(@{open_val:.2f} ➔ @{curr_val:.2f}) en las últimas {hours_elapsed:.1f}h. "
+            f"Posible alerta de lesión oculta del rival o flujo masivo en Pinnacle."
+        )
+        bonus = min(100.0, max(20.0, max_drop * 5.0))
+    else:
+        badge = "⚪ LÍNEA ESTABLE"
+        desc = "Fluctuación regular del mercado sin movimientos institucionales abruptos."
+        bonus = 0.0
+
+    return {
+        "is_steam": is_steam,
+        "steam_detected": is_steam,
+        "drop_pct": round(max_drop, 1),
+        "side": favored_side,
+        "player": favored_player,
+        "open_odds": open_val,
+        "current_odds": curr_val,
+        "hours_elapsed": round(hours_elapsed, 1),
+        "bookmaker": cached.get("bookmaker", "Pinnacle"),
+        "badge": badge,
+        "description": desc,
+        "bonus_points": round(bonus, 1),
+    }
+
+
 @cache_decorator
 def fetch_tennis_odds(
     sport_key: str,
     api_key: Optional[str] = None,
-    regions: str = "eu,us",
+    regions: str = "eu,uk,us",
     markets: str = "h2h",
     is_demo: bool = True,
     force_nonce: int = 0,
@@ -292,7 +537,11 @@ def fetch_tennis_odds(
         metadata["requests_remaining"] = "500 (Modo Demo Activo)"
         metadata["requests_used"] = "0"
         metadata["source"] = "demo"
-        return get_simulation_matches(sport_key), metadata, None
+        matches = get_simulation_matches(sport_key)
+        for m in matches:
+            update_tennis_steam_cache(m)
+            m["steam_move"] = detect_tennis_steam_moves(m)
+        return matches, metadata, None
 
     url = f"{ODDS_API_BASE_URL}/sports/{sport_key}/odds/"
     params = {
@@ -329,6 +578,8 @@ def fetch_tennis_odds(
             surface = tour_meta.get("surface", "Dura Outdoor")
             for ev in data:
                 ev["surface"] = surface
+                update_tennis_steam_cache(ev)
+                ev["steam_move"] = detect_tennis_steam_moves(ev)
             return data, metadata, None
 
         if resp.status_code == 401:

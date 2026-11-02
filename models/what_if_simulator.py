@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
+from etl.tennis_odds_client import extract_event_tennis_odds
 from models.markov_engine import generate_tennis_market_catalog, generate_tennis_sgp_cards
 
 
@@ -91,17 +92,8 @@ def build_cross_match_tennis_parlay(
         match_title = f"{p_a} vs {p_b}"
         surface = ev.get("surface", selected_surface)
 
-        # Extract retail odds if present
-        retail_odds_map = {}
-        for bm in ev.get("bookmakers", []):
-            if bm.get("key", "").lower() != "pinnacle":
-                for m in bm.get("markets", []):
-                    if m.get("key") == "h2h":
-                        for o in m.get("outcomes", []):
-                            if o.get("name") == p_a:
-                                retail_odds_map["1"] = o.get("price", 0.0)
-                            elif o.get("name") == p_b:
-                                retail_odds_map["2"] = o.get("price", 0.0)
+        # Extract sharp / retail odds for this fixture
+        retail_odds_map = extract_event_tennis_odds(ev)
 
         ai_adj = adjustments.get(match_title)
 

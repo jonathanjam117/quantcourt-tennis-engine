@@ -594,14 +594,16 @@ def get_player_profile(player_name: str, surface: str) -> Dict[str, float]:
     Dict[str, float]
         Keys: ``spw``, ``rpw``, ``hold``, ``break``, ``elo``.
     """
+    # Direct substring / token match first (handles "Jannik Sinner" -> "Sinner")
+    lower = player_name.strip().lower()
+    for key, surfaces in PLAYER_PROFILES.items():
+        k_low = key.lower()
+        if k_low == lower or k_low in lower or lower in k_low:
+            return dict(surfaces.get(surface, TOUR_AVERAGES.get(surface, TOUR_AVERAGES[SURFACE_HARD_OUTDOOR])))
+
     try:
         from rapidfuzz import fuzz  # type: ignore[import-untyped]
     except ImportError:
-        # Graceful degradation: exact case-insensitive substring match.
-        lower = player_name.strip().lower()
-        for key, surfaces in PLAYER_PROFILES.items():
-            if lower in key.lower() or key.lower() in lower:
-                return dict(surfaces.get(surface, TOUR_AVERAGES.get(surface, TOUR_AVERAGES[SURFACE_HARD_OUTDOOR])))
         return dict(TOUR_AVERAGES.get(surface, TOUR_AVERAGES[SURFACE_HARD_OUTDOOR]))
 
     best_score: float = 0.0
@@ -609,12 +611,15 @@ def get_player_profile(player_name: str, surface: str) -> Dict[str, float]:
     query = player_name.strip()
 
     for key in PLAYER_PROFILES:
-        score: float = fuzz.token_sort_ratio(query, key)
+        score: float = max(
+            float(fuzz.token_set_ratio(query, key)),
+            float(fuzz.partial_ratio(query.lower(), key.lower()))
+        )
         if score > best_score:
             best_score = score
             best_key = key
 
-    if best_key is not None and best_score >= 72:
+    if best_key is not None and best_score >= 70:
         profile = PLAYER_PROFILES[best_key]
         return dict(profile.get(surface, TOUR_AVERAGES.get(surface, TOUR_AVERAGES[SURFACE_HARD_OUTDOOR])))
 

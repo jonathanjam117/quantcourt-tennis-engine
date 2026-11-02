@@ -20,6 +20,26 @@ import streamlit as st
 # Load environment variables
 load_dotenv()
 
+def _get_secret(key: str, default: str = "") -> str:
+    """Reads a secret from st.secrets (Streamlit Cloud) with fallback to os.getenv (local)."""
+    try:
+        if hasattr(st, "secrets"):
+            if key in st.secrets:
+                val = st.secrets[key]
+                if val is not None and str(val).strip():
+                    return str(val).strip()
+            for section in st.secrets:
+                sec_obj = st.secrets[section]
+                if isinstance(sec_obj, dict) and key in sec_obj:
+                    val = sec_obj[key]
+                    if val is not None and str(val).strip():
+                        return str(val).strip()
+    except Exception:
+        pass
+    val = os.getenv(key, default)
+    return str(val).strip() if val else default
+
+
 # Database & ETL imports
 from database.db_manager import (
     add_bet,
@@ -41,6 +61,7 @@ from etl.surface_profiles import (
     get_surface_emoji,
 )
 from etl.tennis_odds_client import (
+    extract_event_tennis_odds,
     fetch_tennis_odds,
     format_short_local_time,
     format_to_local_time,
@@ -54,6 +75,7 @@ from models.ai_tennis_agent import (
 )
 from models.kelly_risk import calculate_kelly_stake, evaluate_opportunity_filters
 from models.markov_engine import (
+    analyze_tennis_match_opportunities,
     generate_tennis_market_catalog,
     generate_tennis_sgp_cards,
 )
@@ -196,6 +218,14 @@ with st.sidebar:
         step=0.5,
         help="Solo destaca mercados cuya ventaja matemática (+EV) supere este umbral.",
     )
+    odds_range = st.slider(
+        "Rango Eficiente de Cuotas",
+        min_value=1.20,
+        max_value=3.50,
+        value=(1.30, 2.80),
+        step=0.05,
+        help="Rango óptimo para maximizar valor y reducir rachas de varianza.",
+    )
 
     st.caption(
         f"🔒 **Tope de Seguridad**: Máximo **3.5% de la banca** por operación "
@@ -205,10 +235,15 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 🔌 Conectividad & API")
 
-    env_odds_key = os.getenv("THE_ODDS_API_KEY", "")
-    env_gemini_key = os.getenv("GEMINI_API_KEY", "")
+    env_odds_key = _get_secret("THE_ODDS_API_KEY", "")
+    env_gemini_key = _get_secret("GEMINI_API_KEY", "")
+    has_api_key = bool(env_odds_key)
 
-    demo_mode = st.toggle("🧪 Modo Simulación Realista", value=True, help="Partidos sintéticos ATP/WTA de alta fidelidad.")
+    demo_mode = st.toggle(
+        "🧪 Modo Simulación Realista",
+        value=not has_api_key,
+        help="Partidos sintéticos ATP/WTA de alta fidelidad cuando no hay API Key activa.",
+    )
 
     odds_api_key = st.text_input(
         "The Odds API Key",
@@ -267,10 +302,66 @@ if err_api:
     st.info(f"ℹ️ {err_api}")
 
 
+# ------------------------------------------------------------------------------
+# ESCANEO AUTOMÁTICO DE OPORTUNIDADES (+EV SCANNER)
+# ------------------------------------------------------------------------------
+is_using_demo = bool(demo_mode or meta_api.get("source") == "demo")
+if not is_using_demo:
+    st.success("⚡ CUOTAS SHARP DE ALTA LIQUIDEZ (PINNACLE / BET365) SINCRONIZADAS AUTOMÁTICAMENTE")
+else:
+    st.info("ℹ️ MODO DEMO: CUOTAS DE PRUEBA REALISTAS (DESACTIVA MODO SIMULACIÓN PARA USAR API EN VIVO)")
+
+if "tennis_ai_adjustments" not in st.session_state:
+    st.session_state.tennis_ai_adjustments = {}
+
+detected_opportunities: List[Dict[str, Any]] = []
+all_fixture_rows: List[Dict[str, Any]] = []
+
+for ev_scan in events:
+    p1_s = ev_scan.get("home_team", "Jugador A")
+    p2_s = ev_scan.get("away_team", "Jugador B")
+    m_title_s = f"{p1_s} vs {p2_s}"
+    ai_adj_s = st.session_state.tennis_ai_adjustments.get(m_title_s, DEFAULT_TACTICAL_ADJUSTMENT)
+
+    ev_opps = analyze_tennis_match_opportunities(
+        event=ev_scan,
+        sport_meta=tour_meta,
+        bankroll=current_bk_calc,
+        kelly_k=kelly_mult,
+        min_ev=min_ev_thresh,
+        min_odds=odds_range[0],
+        max_odds=odds_range[1],
+        ai_adjustment=ai_adj_s,
+    )
+    detected_opportunities.extend(ev_opps)
+
+    o_data = extract_event_tennis_odds(ev_scan)
+    if ev_opps:
+        best_ev = max(ev_opps, key=lambda x: x["ev_percent"])
+        verdict = f"🟢 +EV: {best_ev['market']} (+{best_ev['ev_percent']:.1f}%)"
+        has_val = True
+    else:
+        verdict = "⚪ Sin Ventaja (Margen Casa)"
+        has_val = False
+
+    all_fixture_rows.append({
+        "Fecha/Hora (Local)": format_short_local_time(ev_scan.get("commence_time", "")),
+        "Partido": m_title_s,
+        "1 (Local)": f"@{o_data['1']:.2f}",
+        "2 (Visita)": f"@{o_data['2']:.2f}",
+        "Casa Ref": o_data.get("bookmaker", "Sharp Book"),
+        "Diagnóstico QuantCourt": verdict,
+        "_has_value": has_val,
+    })
+
+detected_opportunities.sort(key=lambda x: x["ev_percent"], reverse=True)
+
+
 # ==============================================================================
 # TABS PRINCIPALES (AISLADAS CON TRY/EXCEPT)
 # ==============================================================================
-tab1, tab2, tab3, tab4 = st.tabs([
+tab_scanner, tab1, tab2, tab3, tab4 = st.tabs([
+    "🎯 Señales de Apuesta (+EV Finder)",
     "🎾 Centro de Partido & Combinadas BetPlay",
     "🔮 Simulador What-If & Boleto Cruzado",
     "📈 Contabilidad & Auditoría (SQLite)",
@@ -278,7 +369,192 @@ tab1, tab2, tab3, tab4 = st.tabs([
 ])
 
 # ------------------------------------------------------------------------------
-# PESTAÑA 1: CENTRO DE PARTIDO & COMBINADAS BETPLAY
+# PESTAÑA 1: SEÑALES DE APUESTA DE LA JORNADA (+EV FINDER)
+# ------------------------------------------------------------------------------
+with tab_scanner:
+    try:
+        st.subheader("🎯 Señales de Apuesta (+EV Finder) — Detección Automática Sharp")
+        st.caption(
+            "Sistema cuantitativo automático alimentado por oráculos globales de alta liquidez "
+            "(Pinnacle/Bet365 Vig-Free) y Cadenas de Markov jerárquicas."
+        )
+
+        min_qual_ev = float(min_ev_thresh)
+        min_o, max_o = odds_range
+        qualified_signals = [
+            opp for opp in detected_opportunities
+            if float(opp.get("oracle_score", 0.0)) > 65.0
+            and float(opp.get("ev_percent", 0.0)) >= min_qual_ev
+            and min_o <= float(opp.get("odds", 0.0)) <= max_o
+            and float(opp.get("recommended_stake", 0.0)) > 0
+        ]
+
+        qualified_matches = set(opp.get("match", "") for opp in qualified_signals)
+        discarded_fixtures = [
+            fix for fix in all_fixture_rows
+            if fix.get("Partido", "") not in qualified_matches
+        ]
+
+        # ----------------------------------------------------------------------
+        # BLOQUE SUPERIOR: OPORTUNIDADES AUTOMÁTICAS CON +EV DETECTADAS HOY
+        # ----------------------------------------------------------------------
+        st.markdown("### 🎯 Oportunidades Automáticas con +EV (Modo Oráculo MCMC)")
+        st.caption(
+            f"Filtros de Gobernanza Institucional: **Score de Oráculo > 65/100**, **EV ≥ {min_qual_ev:.1f}%**, "
+            f"**Cuotas [{min_o:.2f}, {max_o:.2f}]**, y **Kelly Stake** (k={kelly_mult})."
+        )
+
+        if not qualified_signals:
+            st.warning(
+                f"⚠️ **Sin operaciones 'Luz Verde' hoy:** Ninguna selección alcanzó el Score de Oráculo institucional "
+                f"(> 65/100) y filtros de seguridad simultáneos. "
+                "El modelo cuantitativo protege el 100% de tu capital bloqueando apuestas con varianza excesiva o margen desfavorable."
+            )
+        else:
+            st.success(
+                f"🟢 **{len(qualified_signals)} Oportunidad(es) con Luz Verde Detectada(s)** — Ventaja Matemática Verificada:"
+            )
+
+            for s_idx, sig in enumerate(qualified_signals):
+                m_title = sig.get("match", "Partido")
+                t_name = sig.get("tournament", tour_meta.get("name", "Torneo"))
+                m_market = sig.get("market", "")
+                m_sel = sig.get("selection", "")
+                m_odds = float(sig.get("odds", 0.0))
+                m_ev = float(sig.get("ev_percent", 0.0))
+                m_stake = float(sig.get("recommended_stake", 0.0))
+                m_stake_str = format_money(m_stake, selected_curr)
+                m_bm = sig.get("bookmaker", "Sharp Book")
+                m_time = format_short_local_time(sig.get("commence_time", ""))
+
+                display_pick = f"{m_market} → {m_sel}" if m_market and m_market not in m_sel else m_sel
+
+                o_score = float(sig.get("oracle_score", 0.0))
+                is_gold = bool(sig.get("is_golden_pick", False) or o_score >= 90.0)
+                steam_data = sig.get("steam_move", {})
+                is_steam = bool(steam_data.get("is_steam", False))
+                mc_prob = float(sig.get("monte_carlo_prob", sig.get("effective_prob_pct", 50.0)))
+
+                if is_gold:
+                    card_border = "#fbbf24"
+                    badge_tag = '<span style="background: linear-gradient(90deg, #b45309, #d97706); color: #fffbeb; font-weight: 900; font-size: 0.78rem; padding: 3px 10px; border-radius: 6px; border: 1px solid #fef3c7;">🔥 GOLDEN PICK (Alta Certeza Matemática)</span>'
+                else:
+                    card_border = "#10b981"
+                    badge_tag = '<span style="background-color: #065f46; color: #a7f3d0; font-weight: 800; font-size: 0.78rem; padding: 3px 8px; border-radius: 6px;">🟢 LUZ VERDE (+EV Calificado)</span>'
+
+                steam_pill = f'<span style="background: rgba(239, 68, 68, 0.22); border: 1px solid #ef4444; color: #fca5a5; font-weight: 800; font-size: 0.76rem; padding: 3px 8px; border-radius: 6px; margin-left: 6px;">🚨 SMART MONEY (-{steam_data.get("drop_pct", 0)}%)</span>' if is_steam else ''
+
+                render_clean_html(f"""
+                <div style="background: linear-gradient(135deg, #0f192d 0%, #172554 100%); border: 1.5px solid {card_border}; border-radius: 12px; padding: 14px 18px; margin-bottom: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.35);">
+                    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                        <div>
+                            {badge_tag}
+                            <span style="background: rgba(168, 85, 247, 0.20); border: 1px solid #c084fc; color: #e9d5ff; font-weight: 800; font-size: 0.76rem; padding: 3px 8px; border-radius: 6px; margin-left: 6px;">🔮 Score: {o_score:.1f}/100</span>
+                            <span style="background: rgba(56, 189, 248, 0.18); border: 1px solid #38bdf8; color: #bae6fd; font-weight: 800; font-size: 0.76rem; padding: 3px 8px; border-radius: 6px; margin-left: 6px;">🎲 Monte Carlo: {mc_prob:.1f}%</span>
+                            {steam_pill}
+                            <span style="color: #94a3b8; font-size: 0.82rem; margin-left: 8px;">🏆 {t_name} ({active_surface}) | 📅 {m_time}</span>
+                            <div style="font-size: 1.20rem; font-weight: 800; color: #ffffff; margin-top: 4px;">
+                                🎾 {m_title}
+                            </div>
+                        </div>
+                        <div style="text-align: right;">
+                            <span style="font-size: 1.35rem; font-weight: 800; color: #fbbf24;">@{m_odds:.2f}</span>
+                            <span style="color: #64748b; font-size: 0.85rem; margin-left: 4px;">({m_bm})</span>
+                        </div>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.08); flex-wrap: wrap; gap: 8px;">
+                        <div style="font-size: 0.95rem; color: #f1f5f9;">
+                            👉 <b>Selección Recomendada:</b> <span style="color: #38bdf8; font-weight: 700;">{display_pick}</span>
+                        </div>
+                        <div style="display: flex; gap: 16px; align-items: center;">
+                            <span style="background: rgba(16, 185, 129, 0.15); border: 1px solid #10b981; color: #34d399; font-weight: 800; font-size: 0.92rem; padding: 3px 10px; border-radius: 6px;">
+                                📈 EV: +{m_ev:.1f}%
+                            </span>
+                            <span style="background: rgba(245, 158, 11, 0.15); border: 1px solid #f59e0b; color: #fbbf24; font-weight: 800; font-size: 0.92rem; padding: 3px 10px; border-radius: 6px;">
+                                💰 Stake Kelly: {m_stake_str}
+                            </span>
+                        </div>
+                    </div>
+                </div>
+                """)
+
+                c_act1, c_act2 = st.columns([1.3, 2.7])
+                with c_act1:
+                    sig_save_key = f"save_sig_tennis_{s_idx}_{m_title}_{m_market}"
+                    if st.button(f"💾 Registrar Señal #{s_idx+1} en SQLite", key=sig_save_key, use_container_width=True):
+                        new_id = add_bet(
+                            sport="Tenis",
+                            tournament=t_name,
+                            surface=active_surface,
+                            match_name=m_title,
+                            market=m_market,
+                            selection=m_sel,
+                            bookmaker=m_bm,
+                            odds=m_odds,
+                            fair_odds=sig.get("fair_odds", round(1.0 / (sig.get("effective_prob_pct", 50.0)/100.0), 2)),
+                            ev_percent=m_ev,
+                            stake=m_stake,
+                            status="Pendiente",
+                            notes=sig.get("description", "Detección cuantitativa automática sharp."),
+                            ai_analysis="",
+                        )
+                        st.toast(f"✅ ¡Señal #{new_id} guardada en quantcourt.db!", icon="💾")
+                        st.success(f"Apuesta #{new_id} guardada con éxito en SQLite.")
+                with c_act2:
+                    st.caption(f"ℹ️ Sincronizado automáticamente sin entradas manuales. Cuota justa: `@{sig.get('fair_odds', 0.0):.2f}` | Probabilidad: `{sig.get('effective_prob_pct', 0.0)}%`")
+
+            # Tabla resumen de señales
+            st.markdown("##### 📊 Resumen Ejecutivo de Operaciones Calificadas:")
+            summary_rows = []
+            for i, opp in enumerate(qualified_signals):
+                summary_rows.append({
+                    "#": i + 1,
+                    "Fecha/Hora (Local)": format_short_local_time(opp.get("commence_time", "")),
+                    "Partido": opp["match"],
+                    "Mercado": opp["market"],
+                    "Selección": opp["selection"],
+                    "Casa": opp["bookmaker"],
+                    "Cuota": f"{opp['odds']:.2f}",
+                    "Cuota Justa": f"{opp['fair_odds']:.2f}",
+                    "Prob. Efectiva": f"{opp['effective_prob_pct']}%",
+                    "EV (%)": f"+{opp['ev_percent']:.1f}%",
+                    f"Stake ({selected_curr})": format_money(opp['recommended_stake'], selected_curr),
+                    "% Bankroll": f"{opp['recommended_stake_pct']}%",
+                })
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+        # ----------------------------------------------------------------------
+        # SECCIÓN INFERIOR: PARTIDOS DESCARTADOS POR LA ESTADÍSTICA (EN ROJO)
+        # ----------------------------------------------------------------------
+        st.markdown("---")
+        with st.expander(
+            f"⛔ Partidos Descartados por la Estadística ({len(discarded_fixtures)} encuentros sin ventaja)",
+            expanded=False,
+        ):
+            render_clean_html("""
+            <div style="background: rgba(239, 68, 68, 0.12); border: 1.5px solid #ef4444; border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; color: #fca5a5; font-weight: 600; font-size: 0.88rem;">
+                ⛔ <b>Descartados por el Modelo Cuantitativo:</b> Los siguientes encuentros presentan Esperanza Matemática Negativa (-EV), cuotas desfavorables por el margen de la casa o están fuera de los umbrales seguros. No se recomienda apostar en ellos.
+            </div>
+            """)
+            if discarded_fixtures:
+                discard_df = pd.DataFrame(discarded_fixtures).drop(columns=["_has_value"], errors="ignore")
+                st.dataframe(discard_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("Todos los partidos evaluados cuentan con al menos una oportunidad con valor.")
+
+        if len(detected_opportunities) >= 2:
+            st.markdown("---")
+            st.info(
+                f"💡 **Multiplicador de Retorno:** Se detectaron **{len(detected_opportunities)} apuestas con ventaja matemática**. "
+                "¡Pasa a la pestaña **'🎾 Centro de Partido & Combinadas BetPlay'** para ver las combinadas sugeridas (Same-Game Parlay) y mercados detallados!"
+            )
+
+    except Exception as e:
+        st.error(f"Error en Pestaña 1 (Señales de Apuesta): {e}")
+
+
+# ------------------------------------------------------------------------------
+# PESTAÑA 2: CENTRO DE PARTIDO & COMBINADAS BETPLAY
 # ------------------------------------------------------------------------------
 with tab1:
     try:
@@ -306,17 +582,8 @@ with tab1:
             cur_match_name = f"{cur_p1} vs {cur_p2}"
             cur_time = format_to_local_time(curr_ev.get("commence_time", ""))
 
-            # Extract retail odds
-            retail_map = {}
-            for bm in curr_ev.get("bookmakers", []):
-                if bm.get("key", "").lower() != "pinnacle":
-                    for m in bm.get("markets", []):
-                        if m.get("key") == "h2h":
-                            for o in m.get("outcomes", []):
-                                if o.get("name") == cur_p1:
-                                    retail_map["1"] = o.get("price", 0.0)
-                                elif o.get("name") == cur_p2:
-                                    retail_map["2"] = o.get("price", 0.0)
+            # Extract sharp / retail odds automatically
+            retail_map = extract_event_tennis_odds(curr_ev)
 
             # Session state for AI adjustments
             if "tennis_ai_adjustments" not in st.session_state:
@@ -354,12 +621,14 @@ with tab1:
                 best_of=tour_meta.get("best_of", 3),
             )
 
-            # Generate Same-Game Parlay Cards
+            # Generate Same-Game Parlay Cards with Monte Carlo & Steam Moves
             sgp_cards = generate_tennis_sgp_cards(
                 catalog=catalog,
                 bankroll=current_bk_calc,
                 kelly_multiplier=kelly_mult,
                 ai_adj=ai_adj,
+                mc_sim=curr_ev.get("monte_carlo_sim"),
+                steam_data=curr_ev.get("steam_move"),
             )
 
             # ------------------------------------------------------------------
@@ -442,13 +711,25 @@ with tab1:
                             )
 
                         st.markdown("---")
+                        c_score = float(card.get("oracle_score", 0.0))
+                        c_gold = bool(card.get("is_golden_pick", False))
+                        c_steam = card.get("steam_move", {})
+                        if c_gold:
+                            st.info("🔥 **GOLDEN PICK (Alta Certeza Matemática - Score ≥ 90)**")
+                        if c_steam and c_steam.get("is_steam"):
+                            st.error(f"🚨 **ALERTA SMART MONEY**: Caída de {c_steam.get('drop_pct')}% detectada!")
+
                         sub_c1, sub_c2 = st.columns(2)
                         with sub_c1:
                             st.metric("Cuota Total", f"@{card['odds']:.2f}")
-                            st.metric("Probabilidad", f"{card['prob_pct']}%")
+                            st.metric("Probabilidad MCMC", f"{card['prob_pct']}%")
                         with sub_c2:
-                            st.metric("Ventaja +EV", f"{card['ev_percent']:+.1f}%")
-                            st.metric("Stake Sugerido", format_money(card["stake"], selected_curr))
+                            st.metric("Score Oráculo", f"{c_score:.1f}/100")
+                            if c_score <= 65.0:
+                                st.metric("Stake Sugerido", f"🔒 $0 ({selected_curr})")
+                                st.caption("🔒 Stake bloqueado: Score ≤ 65")
+                            else:
+                                st.metric("Stake Sugerido", format_money(card["stake"], selected_curr))
 
                         save_btn = st.button(
                             f"💾 Guardar en SQLite",
