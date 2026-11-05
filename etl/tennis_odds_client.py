@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 try:
     import streamlit as st
-    cache_decorator = st.cache_data(ttl=300, show_spinner=False)
+    cache_decorator = st.cache_data(ttl=14400, show_spinner=False)
 except Exception:
     def cache_decorator(func):
         return func

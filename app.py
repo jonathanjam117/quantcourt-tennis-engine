@@ -253,6 +253,11 @@ with st.sidebar:
     )
 
     st.markdown("---")
+    if st.sidebar.button("🔄 Actualizar Cuotas (API)", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.markdown("---")
     st.markdown("### 🧠 Agente Táctico Gemini")
     ai_enabled = st.toggle("Activar Evaluación IA", value=True)
     gemini_key = st.text_input("Gemini API Key", value=env_gemini_key, type="password")
@@ -285,6 +290,7 @@ if "cache_nonce" not in st.session_state:
 if refresh_btn:
     st.session_state.cache_nonce += 1
     st.cache_data.clear()
+    st.rerun()
 
 tour_meta = tournaments[selected_tour_key]
 active_surface = tour_meta.get("surface", "Dura Outdoor")
